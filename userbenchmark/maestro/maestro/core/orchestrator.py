@@ -9,10 +9,11 @@ import torch
 import pandas as pd
 
 from .block import BlockRegistry, CommBlock, GEMMBlock
-from .axis import Axis
+from .axis import Axis, TorchAxis
 from .profilers import profiler_ctx
 from .utils.distributed import get_rank_and_world_size, _DistUtils, root_print, dist_print
 from .utils.logging import get_logger, get_root_rank_logger
+from .utils.start_gate import CUDAStartGate
 
 
 
@@ -78,7 +79,6 @@ class Orchestrator:
             raise ValueError("Maestro is designed to run on multiple ranks, please use torchrun or slurm to launch the program.")
 
         self._prepare_tensors_pool()
-        from .utils.start_gate import CUDAStartGate
         self._start_gate = CUDAStartGate()
 
     def run_all_patterns(self):
@@ -478,7 +478,6 @@ class Orchestrator:
         Allocate Maestro's tensor pool from PyTorch's NCCL allocator and
         register it on the axis process groups that run communication blocks.
         """
-        from .axis import TorchAxis
         groups = [
             axis.get_process_group()
             for axis in self.axes.values()
