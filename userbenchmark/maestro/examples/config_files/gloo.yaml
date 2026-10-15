@@ -1,0 +1,29 @@
+# Four GPU-equipped ranks: eager package startup retains the default NCCL group.
+# These workloads use CPU/Gloo; reported spans are blocking host-call timings.
+dtype: float32
+warmup_iters: 1
+iters: 3
+stop_on_error: true
+backends:
+  axis: {name: torch, backend: gloo}
+  # host is selected automatically for Gloo; cupti is the default for NCCL.
+axes:
+  rows: {team_size: 2, team_stride: 1}
+  columns: {team_size: 2, team_stride: 2}
+patterns:
+  - name: reduce_gather
+    ops:
+      - {block: torch_all_reduce, axis: rows, name: reduce, vector_size: 64KiB}
+      - {block: torch_all_gather, axis: columns, name: gather, vector_size: 64KiB}
+  - name: scatter_alltoall
+    ops:
+      - {block: torch_reduce_scatter, axis: rows, name: scatter, vector_size: 64KiB}
+      - {block: torch_alltoall, axis: columns, name: alltoall, vector_size: 64KiB}
+  - name: ring_reduce
+    ops:
+      - {block: torch_send_recv_ring, axis: rows, name: ring, vector_size: 64KiB}
+      - {block: torch_reduce, axis: columns, name: reduce, vector_size: 64KiB}
+  - name: serial
+    ops:
+      - {block: torch_all_reduce, axis: rows, name: first, vector_size: 64KiB}
+      - {block: torch_reduce, axis: rows, name: second, vector_size: 64KiB}

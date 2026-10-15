@@ -9,11 +9,12 @@ import torch
 import pandas as pd
 
 from .block import BlockRegistry, CommBlock, GEMMBlock
-from .axis import Axis, TorchAxis
+from .axis import Axis
 from .profilers import profiler_ctx
 from .utils.distributed import get_rank_and_world_size, _DistUtils, root_print, dist_print
 from .utils.logging import get_logger, get_root_rank_logger
-from .utils.start_gate import CUDAStartGate
+from .execution import CUDAExecution
+from .allocator import NCCLAllocator
 
 
 
@@ -35,6 +36,9 @@ class Orchestrator:
         register_buffers: bool = False,
         axis_envs: dict[str, dict[str, str]] | None = None,
         axis_params: dict[str, dict] | None = None,
+        dist_utils: _DistUtils = None,
+        execution_cls=CUDAExecution,
+        allocator=None,
     ):
         """
         patterns: Pattern to execute
@@ -44,9 +48,12 @@ class Orchestrator:
         warmup_iters: Number of warmup iterations
         iters: Number of iterations
         oob_dist_utils: Out-of-band distributed utilities to use
-            If not provided, the distributed utilities of the axis class will be used
+            If not provided, dist_utils is used; a separately supplied utility is borrowed
         stop_on_error: Stop the execution if an error occurs in one of the patterns
         register_buffers: Register pytorch buffers (PyTorch only)
+        dist_utils: Owned distributed runtime; defaults to an independent NCCL runtime
+        execution_cls: Backend execution policy (CUDA by default)
+        allocator: Backend buffer allocator (NCCL/CUDA fp16 by default)
         axis_params: Process-group options per axis, such as traffic_class
         axis_envs: Experimental overrides during process-group creation only,
             enabled by MAESTRO_USE_PER_AXIS_ENV_VARS; may lead to undefined behavior
@@ -60,26 +67,30 @@ class Orchestrator:
         self.stop_on_error = stop_on_error
         self.register_buffers = register_buffers
 
-        axis_envs = axis_envs or {}
-        axis_params = axis_params or {}
-        self.axes = {
-            axis_name: self.axis_cls(groups, name=axis_name, envs=axis_envs.get(axis_name),
-                                          params=axis_params.get(axis_name))
-            for axis_name, groups in axes_cfg.items()
-        }
-
+        from .utils.distributed import _TorchNCCLDistUtils
+        self.dist_utils = dist_utils or _TorchNCCLDistUtils()
+        self.oob_dist_utils = oob_dist_utils or self.dist_utils
+        self.rank = self.dist_utils.get_rank()
+        self.world_size = self.dist_utils.get_world_size()
+        self.allocator = allocator or NCCLAllocator("cuda", torch.float16, register_buffers)
+        self.axes = {}
         self._tensors_pool = {}
-        self._torch_mem_pool = None
-        self._registered_groups = []
-
-        self.oob_dist_utils = oob_dist_utils or self.axis_cls.dist_utils
-        self.rank, self.world_size = get_rank_and_world_size()
-
-        if self.world_size == 1:
-            raise ValueError("Maestro is designed to run on multiple ranks, please use torchrun or slurm to launch the program.")
-
-        self._prepare_tensors_pool()
-        self._start_gate = CUDAStartGate()
+        self.execution = None
+        try:
+            if self.world_size == 1:
+                raise ValueError("Maestro requires multiple ranks; use torchrun or slurm")
+            axis_envs = axis_envs or {}
+            axis_params = axis_params or {}
+            for name, groups in axes_cfg.items():
+                self.axes[name] = axis_cls(
+                    groups, name=name, envs=axis_envs.get(name), params=axis_params.get(name),
+                    dist_utils=self.dist_utils, allocator=self.allocator,
+                )
+            self.execution = execution_cls(self.axes)
+            self._prepare_tensors_pool()
+        except BaseException:
+            self.destroy()
+            raise
 
     def run_all_patterns(self):
         """Run all the patterns"""
@@ -109,8 +120,8 @@ class Orchestrator:
         # A first-use allocation or library setup may synchronize the device,
         # which would deadlock if the host had not released the gate yet.
         for block in blocks:
-            block.run()
-            self.axis_cls.synchronize_all()
+            self.profiler.run_block(block)
+            self.execution.synchronize()
 
         # Warmup 20 times - this is independent of warmup_iters which are perf-related
         rlogger.debug(f"Default warmup")
@@ -143,7 +154,7 @@ class Orchestrator:
         columns = ["Block", "Size (B)",  "Avg latency (ms)", "Min lat. (ms)", "Max lat. (ms)", "P99 lat. (ms)", "Avg BW (GB/s)"]
         col_space = 17
         root_print("\n")
-        root_print(f"Pattern: {pattern['name']}")
+        root_print(f"Pattern: {pattern['name']} ({self.profiler.timing_domain})")
         root_print(f"| ".join([col.ljust(col_space) for col in columns]))
         root_print("-" * (len(columns) * col_space + len(columns)))
 
@@ -396,8 +407,8 @@ class Orchestrator:
         for block in blocks:
             self.profiler.reset()
             with self.profiler(nosave=True):
-                block.run()
-                self.axis_cls.synchronize_all()
+                self.profiler.run_block(block)
+                self.execution.synchronize()
 
             results = self.profiler.get_results()
 
@@ -420,29 +431,7 @@ class Orchestrator:
         return streams_and_activities_per_block
 
     def _execute(self, blocks: list, iters: int = 1):
-        """Enqueue all axes behind a recorded, host-released start event."""
-        if iters == 0:
-            return
-        self.oob_dist_utils.barrier()
-        axes = set(block.axis for block in blocks)
-
-        with self._start_gate.hold(axes):
-            for _ in range(iters):
-                for block in blocks:
-                    block.run()
-
-                # Fence each iteration on every participating axis. The host
-                # release is independent of this stream, avoiding a gate cycle.
-                for axis in axes:
-                    torch.cuda.current_stream().wait_stream(axis.stream)
-
-                barrier_handle = self.oob_dist_utils.barrier(async_op=True)
-                assert barrier_handle is not None, "Barrier handle should not be None"
-                for axis in axes:
-                    with axis.use_axis():
-                        barrier_handle.block_current_stream()
-
-        self.axis_cls.synchronize_all()
+        self.execution.execute(blocks, iters, self.oob_dist_utils, self.profiler)
 
     def _prepare_tensors_pool(self):
         """Initialize self._tensors_pool
@@ -451,7 +440,6 @@ class Orchestrator:
            - Check data correctness (that dst_buf is filled with the correct data)
            - Use different dtypes for different blocks (for example, float16 for GEMM and int8 for all_gather)
         """
-        dtype = torch.float16
 
         tensor_sizes = []
         for pattern in self.patterns:
@@ -465,42 +453,7 @@ class Orchestrator:
         if not tensor_sizes or max(tensor_sizes) <= 0:
             raise ValueError("No positive tensor size found across patterns operations, please check your pattern configuration")
 
-        if self.register_buffers:
-            t = self._prepare_nccl_registered_tensor(max(tensor_sizes), dtype)
-        else:
-            t = torch.ones(max(tensor_sizes), device="cuda", dtype=dtype)
-
-            # For now dtype is hardcoded
-        self._tensors_pool["main"] = t
-
-    def _prepare_nccl_registered_tensor(self, tensor_size: int, dtype: torch.dtype) -> torch.Tensor:
-        """
-        Allocate Maestro's tensor pool from PyTorch's NCCL allocator and
-        register it on the axis process groups that run communication blocks.
-        """
-        groups = [
-            axis.get_process_group()
-            for axis in self.axes.values()
-            if isinstance(axis, TorchAxis)
-        ]
-        if not groups:
-            raise RuntimeError("register_buffers=True but no Torch axis was found.")
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        if self._torch_mem_pool is None:
-            backend = groups[0]._get_backend(device)
-            self._torch_mem_pool = torch.cuda.MemPool(backend.mem_allocator)
-
-        with torch.cuda.use_mem_pool(self._torch_mem_pool):
-            tensor = torch.ones(tensor_size, device="cuda", dtype=dtype)
-        torch.cuda.synchronize()
-
-        for group in groups:
-            group._get_backend(device).register_mem_pool(self._torch_mem_pool)
-
-        self._registered_groups.extend(groups)
-        rlogger.info(f"Registered Maestro NCCL tensor pool for {len(groups)} axis process group(s)")
-        return tensor
+        self._tensors_pool["main"] = self.allocator.allocate(max(tensor_sizes), self.axes.values())
 
     def _get_op_tensor_size(self, block_cls, op: dict) -> int:
         if issubclass(block_cls, CommBlock):
@@ -543,31 +496,16 @@ class Orchestrator:
 
         # Initialization uses the current stream; complete it before axes launch
         # work on their own streams. This happens outside profiling.
-        self.axis_cls.synchronize_all()
+        self.execution.synchronize()
         return blocks
 
     def destroy(self):
-        """Destroy the orchestrator"""
-        self._start_gate.close()
-        self._cleanup_registered_pool()
-        self.oob_dist_utils.destroy()
-        self.axis_cls.destroy()
-
-    def _cleanup_registered_pool(self):
-        """Deregister the tensor pool before process groups are destroyed."""
-        torch_mem_pool = self._torch_mem_pool
-        if torch_mem_pool is None:
-            return
-
-        self.axis_cls.synchronize_all()
-        device = torch.device("cuda", torch.cuda.current_device())
-        for group in self._registered_groups:
-            try:
-                group._get_backend(device).deregister_mem_pool(torch_mem_pool)
-            except Exception as exc:
-                logger.warning(f"Failed to deregister NCCL mem pool: {exc}")
-        self.axis_cls.synchronize_all()
-
-        self._tensors_pool.clear()
-        self._torch_mem_pool = None
-        self._registered_groups = []
+        """Release execution and buffers before owned process groups."""
+        try:
+            if self.execution is not None:
+                self.execution.close()
+                self.execution.synchronize()
+            self.allocator.close()
+            self._tensors_pool.clear()
+        finally:
+            self.dist_utils.destroy()

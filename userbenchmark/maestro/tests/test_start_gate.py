@@ -97,9 +97,9 @@ class StartGateTest(unittest.TestCase):
                 pass
 
     def test_execute_enqueues_all_iterations_before_release(self):
-        tree = ast.parse((SOURCE / "core/orchestrator.py").read_text())
-        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Orchestrator")
-        execute = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_execute")
+        tree = ast.parse((SOURCE / "core/execution.py").read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "CUDAExecution")
+        execute = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "execute")
         namespace = {"torch": self.torch}
         exec(compile(ast.Module(body=[execute], type_ignores=[]), "_execute", "exec"), namespace)
         axis = Mock()
@@ -110,10 +110,12 @@ class StartGateTest(unittest.TestCase):
             self.log.append(("barrier", async_op, self.flag.value))
             return Mock() if async_op else None
         obj = types.SimpleNamespace(
-            _start_gate=self.gate, oob_dist_utils=types.SimpleNamespace(barrier=barrier),
-            axis_cls=types.SimpleNamespace(synchronize_all=lambda: self.log.append(("sync", self.flag.value))),
+            _start_gate=self.gate,
+            synchronize=lambda: self.log.append(("sync", self.flag.value)),
         )
-        namespace["_execute"](obj, [block], iters=2)
+        namespace["execute"](obj, [block], iters=2,
+                             dist_utils=types.SimpleNamespace(barrier=barrier),
+                             profiler=types.SimpleNamespace(run_block=lambda b: b.run()))
         self.assertEqual(self.log[0], ("barrier", False, 1))
         self.assertEqual(self.log.count(("block", 0)), 2)
         self.assertEqual(self.log.count(("barrier", True, 0)), 2)

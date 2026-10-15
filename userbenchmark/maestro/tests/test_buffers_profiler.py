@@ -54,7 +54,8 @@ class BufferProfilerTests(unittest.TestCase):
         module(prefix + '.core.utils.distributed', get_rank_and_world_size=lambda: (0, 2),
                _DistUtils=object, root_print=lambda *a: None, dist_print=lambda *a: None)
         module(prefix + '.core.axis', Axis=object, TorchAxis=object)
-        module(prefix + '.core.utils.start_gate', CUDAStartGate=object)
+        module(prefix + '.core.execution', CUDAExecution=object)
+        module(prefix + '.core.allocator', NCCLAllocator=object)
         cls.fake_torch = module('torch', Tensor=Tensor, dtype=object, float16='float16',
                                 zeros=lambda n, **kw: Tensor(n), ones=lambda n, **kw: Tensor(n, 1))
         module('cupti')  # CUPTI absence must not prevent testing reset boundaries.
@@ -97,25 +98,26 @@ class BufferProfilerTests(unittest.TestCase):
                         {'ops': [{'axis': 'x', 'block': 'test', 'vector_size': 4}]}]
         obj.register_buffers = False
         obj._tensors_pool = {}
-        obj.axis_cls = types.SimpleNamespace(synchronize_all=mock.Mock())
+        obj.execution = types.SimpleNamespace(synchronize=mock.Mock())
+        obj.allocator = types.SimpleNamespace(allocate=lambda n, axes: Tensor(n, 1))
         with mock.patch.object(self.block.BlockRegistry, 'get_block_cls', return_value=comm):
             obj._prepare_tensors_pool()
             self.assertEqual(obj._tensors_pool['main'].numel(), 32)
             first, second = obj._create_blocks(obj.patterns[0])
         first.dst_buf.fill_(9)
         self.assertEqual(second.src_buf.storage[16:], [0] * 16)
-        obj.axis_cls.synchronize_all.assert_called_once()
+        obj.execution.synchronize.assert_called_once()
 
-    def test_fallback_allocations_use_fp16_and_axis_sizes(self):
+    def test_fallback_allocations_use_the_axis_allocator(self):
         comm = self.make_comm_cls()
-        axis = types.SimpleNamespace(team_size=lambda: 2)
-        with mock.patch.object(self.fake_torch, 'zeros', wraps=self.fake_torch.zeros) as allocate:
-            comm.from_api_params(axis, 'comm', {'vector_size': 8})
-        allocate.assert_called_once_with(16, device='cuda', dtype='float16')
+        allocate = mock.Mock(side_effect=lambda n, fill=0: Tensor(n, fill))
+        axis = types.SimpleNamespace(team_size=lambda: 2, allocate=allocate)
+        comm.from_api_params(axis, 'comm', {'vector_size': 8})
+        allocate.assert_called_once_with(16, fill=0)
+        allocate.reset_mock()
         gemm = type('TestGemm', (self.block.GEMMBlock,), {'run': lambda self: None})
-        with mock.patch.object(self.fake_torch, 'ones', wraps=self.fake_torch.ones) as allocate:
-            result = gemm.from_api_params(axis, 'gemm', {'mat_a_shape': [2, 3], 'mat_b_shape': [3, 4]})
-        allocate.assert_called_once_with(18, device='cuda', dtype='float16')
+        result = gemm.from_api_params(axis, 'gemm', {'mat_a_shape': [2, 3], 'mat_b_shape': [3, 4]})
+        allocate.assert_called_once_with(18, fill=1)
         self.assertEqual(result.mat_a.shape, (2, 3))
         self.assertEqual(result.mat_b.offset, 6)
 

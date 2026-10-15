@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
 from typing import Iterator, ContextManager
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import contextvars
 import os
 import torch
 
-from .utils.distributed import nccl_torch_dist_utils
 from .utils.logging import get_logger
 
 
@@ -42,15 +41,13 @@ def _temporary_environ(envs: dict[str, str]) -> Iterator[None]:
 
 class Axis(ABC):
 
-    dist_utils = None
-
-    def __init__(self, groups: list[list[int]], name: str = "", envs: dict[str, str] | None = None, params: dict | None = None):
+    def __init__(self, groups: list[list[int]], name: str = "", envs: dict[str, str] | None = None, params: dict | None = None, *, dist_utils, allocator=None):
         """
-        Axis is a set of teams created using the same pattern. Each axis can execute blocks independently from the other axes (i.e it is bound to a GPU single stream)
+        Axis is a set of teams created using the same pattern. Each axis executes blocks serially and can run independently of other axes
         For now, each rank must be in one group of the axis
         """
-        if self.__class__.dist_utils is None:
-            raise ValueError(f"class attribute dist_utils is not set for {self.__class__.__name__}")
+        self.dist_utils = dist_utils
+        self.allocator = allocator
 
         self.groups = groups
         self.name = name
@@ -74,13 +71,11 @@ class Axis(ABC):
     def team_size(self):
         return len(self.my_group_ranks)
 
-    @classmethod
-    def get_rank(cls):
-        return cls.dist_utils.get_rank()
+    def get_rank(self):
+        return self.dist_utils.get_rank()
 
-    @classmethod
-    def get_world_size(cls):
-        return cls.dist_utils.get_world_size()
+    def get_world_size(self):
+        return self.dist_utils.get_world_size()
 
     @contextmanager
     def use_axis(self, block_current_stream=False) -> Iterator[None]:
@@ -97,48 +92,26 @@ class Axis(ABC):
         """Wrapper around a context manager to use the axis"""
         pass
 
-    @staticmethod
-    @abstractmethod
-    def create_event():
-        """Create a new event of the type expected by record_event and wait_event"""
-        pass
-
-    @staticmethod
-    @abstractmethod
-    def record_event(event):
-        """Record the event on the axis
-        Not bound to any axis - just record the event on the current stream
-        """
-        pass
+    def allocate(self, size, fill=0):
+        if self.allocator is None:
+            raise ValueError("This axis has no tensor allocator")
+        return self.allocator.allocate(size, [self]).fill_(fill)
 
     @abstractmethod
-    def wait_event(self, event):
-        """Wait on this axis for completion of a previously recorded event"""
+    def complete_work(self, work):
+        """Make subsequent work on this axis observe completion."""
         pass
 
-    @abstractmethod
-    def synchronize(self):
-        """Wrapper around cudaStreamSynchronize - Block CPU until all the blocks on this axis have finished"""
-        pass
-
-    @classmethod
-    @abstractmethod
-    def synchronize_all(cls):
-        """Wrapper around cudaDeviceSynchronize - Block CPU until all GPU streams have finished"""
-        pass
-
-    @classmethod
-    def destroy(cls):
-        """Destroy the axis"""
-        pass
+    def get_process_group(self):
+        return self.my_group
 
 
 class TorchAxis(Axis):
-    dist_utils = nccl_torch_dist_utils
 
-    def __init__(self, groups: list[list[int]], name: str = "", envs: dict[str, str] | None = None, params: dict | None = None):
+    def __init__(self, groups: list[list[int]], name: str = "", envs: dict[str, str] | None = None, params: dict | None = None, *, dist_utils, allocator=None):
 
-        super().__init__(groups, name=name, envs=envs, params=params)
+        super().__init__(groups, name=name, envs=envs, params=params,
+                         dist_utils=dist_utils, allocator=allocator)
         self.stream = torch.cuda.Stream()
 
     def get_process_group(self) -> torch.distributed.ProcessGroup:
@@ -165,7 +138,15 @@ class TorchAxis(Axis):
     def synchronize_all(cls):
         torch.cuda.synchronize()
 
-    @classmethod
-    def destroy(cls):
-        """Destroy the axis"""
-        cls.dist_utils.destroy()
+    def complete_work(self, work):
+        work.block_current_stream()
+
+
+class HostAxis(Axis):
+    """A serial host queue; the host executor supplies concurrency across axes."""
+
+    def _axis_ctx(self):
+        return nullcontext()
+
+    def complete_work(self, work):
+        work.wait()

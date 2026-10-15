@@ -19,3 +19,9 @@ Requires PyTorch 2.9 or newer. Install Maestro dependencies with `python install
 See the [documentation](docs/) for more:
 - [General documentation](docs/doc.md)
 - [Developer guide](docs/developer.md)
+
+
+Gloo CPU collectives are available through the normal runner with
+[`examples/config_files/gloo.yaml`](examples/config_files/gloo.yaml). See
+[backend selection and timing semantics](docs/doc.md#gloo-and-backend-selection).
+The existing eager NCCL startup still requires GPU-equipped ranks.

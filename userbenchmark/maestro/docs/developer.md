@@ -161,7 +161,7 @@ The registration happens automatically through the `_BlockRegistrer` metaclass w
 
 ### Axes
 
-An **Axis** represents a collection of teams (process groups) that execute operations together. Each axis is bound to a dedicated CUDA stream, enabling concurrent execution across different axes.
+An **Axis** represents a collection of teams (process groups) that execute operations together. CUDA axes use dedicated streams; host axes use serial host queues. An execution policy supplies concurrency across axes, and distributed utilities and the allocator are injected into each axis instance.
 
 #### Axis Configuration
 
@@ -194,10 +194,9 @@ The `TorchAxis` class provides the PyTorch/NCCL implementation:
 
 ```python
 class TorchAxis(Axis):
-    dist_utils = nccl_torch_dist_utils
-
-    def __init__(self, groups: list[list[int]], name: str = ""):
-        super().__init__(groups, name=name)
+    def __init__(self, groups, name="", envs=None, params=None, *, dist_utils, allocator=None):
+        super().__init__(groups, name=name, envs=envs, params=params,
+                         dist_utils=dist_utils, allocator=allocator)
         self.stream = torch.cuda.Stream()  # Dedicated stream
 
     def _axis_ctx(self):
@@ -270,7 +269,7 @@ The orchestrator records a CUDA event behind a stream memory wait on mapped pinn
 
 ### Profilers
 
-**Profilers** capture GPU activity timing information. They must inherit from `profiler_ctx` and implement the context manager protocol.
+**Profilers** capture activity timing information. They inherit from `profiler_ctx` and implement `_enter()` and `_exit()`; the base class supplies the context manager protocol.
 
 #### Profiler Interface
 
@@ -281,11 +280,11 @@ class profiler_ctx(ABC):
         self.output_dir = output_dir
 
     @abstractmethod
-    def __enter__(self):
+    def _enter(self):
         pass
 
     @abstractmethod
-    def __exit__(self, exc_type, exc_value, traceback):
+    def _exit(self, nosave=False):
         # Save results to self._results
         pass
 
@@ -299,7 +298,7 @@ class profiler_ctx(ABC):
 #### Result Format
 
 Each result dictionary must contain:
-- `stream_id`: CUDA stream identifier
+- `stream_id`: serial execution queue identifier (CUDA stream ID or logical host axis name)
 - `duration_ns`: Duration in nanoseconds
 - `kind`: Activity type ("kernel", "memcpy", etc.)
 - `start_ns`: Start timestamp
@@ -365,9 +364,7 @@ class MyCustomBlock(CommBlock):
         src_size = cls.get_src_buf_size(api_params["vector_size"], axis.team_size())
         dst_size = cls.get_dst_buf_size(api_params["vector_size"], axis.team_size())
         if cached_tensor is None:
-            cached_tensor = torch.zeros(
-                cls.get_tensor_size(api_params, axis), device="cuda", dtype=torch.float16
-            )
+            cached_tensor = axis.allocate(cls.get_tensor_size(api_params, axis), fill=0)
 
         src_buf = cached_tensor[:src_size]
         dst_buf = cached_tensor[src_size:src_size + dst_size]
@@ -427,12 +424,12 @@ class MyProfiler(profiler_ctx):
         super().__init__(output_dir)
         # Initialize profiler-specific state
 
-    def __enter__(self):
+    def _enter(self):
         """Start profiling"""
         # Enable profiling
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def _exit(self, nosave=False):
         """Stop profiling and collect results"""
         results = []
 
@@ -446,8 +443,7 @@ class MyProfiler(profiler_ctx):
                 "duration_ns": activity.end - activity.start,
             })
 
-        self._save_results(results)
-        self.save_trace()
+        self._save_results(results)  # The base context handles optional trace saving.
 
     def _save_trace(self, output_file: Path):
         """Optional: Save trace file for visualization"""
@@ -455,29 +451,20 @@ class MyProfiler(profiler_ctx):
         pass
 ```
 
-#### Step 2: Register in main.py
+#### Step 2: Register the profiler
 
 ```python
-# maestro/main.py
-profiler_backend = config["backends"]["profiler"]["name"]
-if profiler_backend == "cupti":
-    from userbenchmark.maestro.maestro.core.profilers import CuptiProfiler
-    profiler = CuptiProfiler(output_dir=config["backends"]["profiler"]["output_dir"])
-elif profiler_backend == "my_profiler":  # Add this
-    from userbenchmark.maestro.maestro.core.profilers.my_profiler import MyProfiler
-    profiler = MyProfiler(output_dir=config["backends"]["profiler"]["output_dir"])
-else:
-    raise ValueError(f"Invalid profiler backend: {profiler_backend}")
+from userbenchmark.maestro.maestro.core.backends import register_profiler
+register_profiler("my_profiler", MyProfiler)
 ```
 
-#### Step 3: Update __init__.py
-
-```python
-# maestro/core/profilers/__init__.py
-from .base import profiler_ctx
-from .cupti import CuptiProfiler
-from .my_profiler import MyProfiler  # Add this
-```
+Declare `execution_mode` (`"cuda"` or `"host"`) and `timing_domain` on the profiler.
+The runner rejects a profiler whose execution mode differs from the backend.
+A tracing profiler can retain the base `run_block(block)` implementation, which
+calls `block.run()`. A host profiler overrides it to record the complete blocking
+call. `HostProfiler` is a working example. Each record's `stream_id` identifies a
+serial execution queue; it can be a CUDA stream ID or a logical host axis name.
+Import your registration module before calling `parse_config` or `run_benchmark`.
 
 ---
 
@@ -579,71 +566,59 @@ patterns:
 
 ### Adding a New Axis Backend
 
-Axis backends must implement the `Axis` interface.
-
-#### Step 1: Create the Axis Class
-
-```python
-# maestro/core/axis.py (or separate file)
-from userbenchmark.maestro.maestro.core.axis import Axis
-from your_backend import dist_utils as my_dist_utils
-
-class MyBackendAxis(Axis):
-    """Custom axis backend"""
-
-    dist_utils = my_dist_utils  # Your distributed utilities
-
-    def __init__(self, groups: list[list[int]], name: str = ""):
-        super().__init__(groups, name=name)
-        # Initialize backend-specific resources
-        self.stream = create_stream()  # Your stream creation
-
-    @staticmethod
-    def create_event():
-        """Create synchronization event"""
-        return MyEvent()
-
-    @staticmethod
-    def record_event(event):
-        """Record event on current stream"""
-        event.record()
-
-    def wait_event(self, event):
-        """Wait for event on this axis's stream"""
-        self.stream.wait_event(event)
-
-    def _axis_ctx(self):
-        """Context manager for using this axis"""
-        return stream_context(self.stream)
-
-    def synchronize(self):
-        """Synchronize this axis's stream"""
-        self.stream.synchronize()
-
-    @classmethod
-    def synchronize_all(cls):
-        """Synchronize all GPU streams"""
-        device_synchronize()
-
-    @classmethod
-    def destroy(cls):
-        """Cleanup resources"""
-        cls.dist_utils.destroy()
-```
-
-#### Step 2: Register in main.py
+Register a bundle of components in `core/backends.py`; the orchestrator does not
+need a backend-specific subclass. Gloo is the reference host implementation.
 
 ```python
-# maestro/main.py
-axis_backend = config["backends"]["axis"]["name"]
-if axis_backend == "torch":
-    axis_cls = TorchAxis
-elif axis_backend == "my_backend":  # Add this
-    from userbenchmark.maestro.maestro.core.axis import MyBackendAxis
-    axis_cls = MyBackendAxis
-else:
-    raise ValueError(f"Invalid axis backend: {axis_backend}")
+from functools import partial
+from userbenchmark.maestro.maestro.core.backends import BackendSpec, register_backend
+from userbenchmark.maestro.maestro.core.axis import HostAxis
+from userbenchmark.maestro.maestro.core.execution import HostExecution
+from userbenchmark.maestro.maestro.core.allocator import TorchAllocator
+from userbenchmark.maestro.maestro.core.utils.distributed import _TorchDistUtils
+
+# Example registration under a new name; the built-in torch/gloo already exists.
+register_backend("my_torch", "gloo", BackendSpec(
+    axis_cls=HostAxis,
+    dist_factory=partial(_TorchDistUtils, backend="gloo"),
+    execution_cls=HostExecution,
+    allocator_cls=TorchAllocator,
+    device="cpu",
+    default_profiler="host",
+))
 ```
+
+The interfaces are:
+
+- **Axis:** accept `groups`, `name`, `envs`, `params`, and injected keyword arguments
+  `dist_utils` and `allocator`; implement `_axis_ctx()` and `complete_work(work)`.
+  CUDA axes additionally expose the stream/event methods used by `CUDAExecution`.
+  `get_rank()` and `get_world_size()` now use the instance's utilities.
+- **Distributed utilities:** own a control group and axis groups; provide rank,
+  world size, group creation, barriers, object gathering, and idempotent cleanup.
+  The Torch implementation creates subgroups alongside the existing default
+  group. Only the eager bootstrap owner destroys the default process group.
+- **Execution:** implement `execute(blocks, iters, dist_utils, profiler)`,
+  `synchronize()`, and `close()`, and declare `mode`. Execute through
+  `profiler.run_block(block)` so host instrumentation also sees every call.
+  Preserve order within each axis and complete an iteration before reusing its
+  buffers. CUDA retains the existing start gate and stream fences; host execution
+  joins one worker per participating axis before the next iteration.
+- **Allocator:** accept device, dtype, and registration settings; implement
+  `allocate(size, axes=())` and `close()`. The orchestrator and block fallback
+  allocations share it. NCCL pool registration belongs to `NCCLAllocator`.
+
+`BackendSpec` declares supported dtypes, process-group options, registration, and
+per-axis environment support. Blocks can declare `supported_devices` and override
+`validate_backend(spec)` for further restrictions. A communication block needing
+an even split sets `requires_even_split = True`, inherited by aliases/subclasses.
+The parser uses the configured dtype's element size before checking team sizes.
+
+Runtime utilities are owned by the orchestrator; a separately supplied
+`oob_dist_utils` is borrowed. Programmatic `run_benchmark` calls leave eager
+bootstrap alive for the next invocation, while CLI entry points close it on exit.
+One backend/device/dtype is selected for the entire run; mixed backends per axis
+and non-Torch buffer representations are outside this implementation's scope.
 
 ---
 
@@ -797,9 +772,9 @@ rlogger.info("Info from root only")
 ### Adding a Profiler
 
 1. Inherit from `profiler_ctx`
-2. Implement `__enter__()` and `__exit__()`
+2. Implement `_enter()` and `_exit()`; the base class supplies context-manager handling
 3. Save results with mandatory fields: `stream_id`, `duration_ns`, `kind`
-4. Register in `main.py`
+4. Register with `register_profiler(name, profiler_cls)` in `core/backends.py`
 
 ### Adding an Operation Preset
 

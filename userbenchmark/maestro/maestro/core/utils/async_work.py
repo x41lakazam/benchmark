@@ -22,3 +22,7 @@ class AsyncWorkHandle(ABC):
             self.work.block_current_stream()
         else:
             raise ValueError(f"Block current stream is not supported for work handle of type {self.type}")
+
+    def wait(self):
+        """Wait for host-visible completion on backends with blocking Work.wait."""
+        return self.work.wait()

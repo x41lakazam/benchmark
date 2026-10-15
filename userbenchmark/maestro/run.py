@@ -22,7 +22,11 @@ def run(args: List[str]):
         sys.exit(1)
 
     config_file = Path(args[0])
-    results_df = run_benchmark(config_file)
+    from .maestro.core.utils.distributed import nccl_torch_dist_utils
+    try:
+        results_df = run_benchmark(config_file)
+    finally:
+        nccl_torch_dist_utils.destroy()
     from .maestro.core.utils.distributed import get_rank_and_world_size
     rank, _ = get_rank_and_world_size()
 

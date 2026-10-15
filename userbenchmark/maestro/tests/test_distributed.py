@@ -36,6 +36,8 @@ class TorchAxisCreationTest(unittest.TestCase):
         fake_dist.GroupMember = _FakeGroupMember
         fake_dist.ProcessGroupNCCL = _FakeProcessGroupNCCL
         fake_dist.init_process_group = mock.Mock()
+        fake_dist.is_initialized = lambda: True
+        self.fake_dist = fake_dist
         fake_dist.get_rank = lambda: 0
         fake_dist.get_world_size = lambda: 2
         fake_dist.barrier = mock.Mock()
@@ -103,6 +105,7 @@ class TorchAxisCreationTest(unittest.TestCase):
             self.distributed._TorchDistUtils
         )
         dist_utils.backend = "gloo"
+        dist_utils._groups = []
 
         group = dist_utils.create_axis([[0, 1]])
 
@@ -111,6 +114,33 @@ class TorchAxisCreationTest(unittest.TestCase):
             self.new_group_calls,
             [{"ranks": [0, 1], "backend": "gloo", "pg_options": None}],
         )
+
+    def test_subgroup_runtime_reuses_bootstrap_and_destroys_only_its_groups(self):
+        before = self.fake_dist.init_process_group.call_count
+        first = self.distributed._TorchDistUtils("gloo")
+        second = self.distributed._TorchDistUtils("gloo")
+        axis_group = first.create_axis([[0, 1]])
+        self.assertEqual(self.fake_dist.init_process_group.call_count, before)
+        first.destroy()
+        self.assertEqual(self.fake_dist.destroy_process_group.call_args_list,
+                         [mock.call(axis_group), mock.call(first.get_world_group())])
+        first.destroy()
+        self.assertEqual(self.fake_dist.destroy_process_group.call_count, 2)
+        self.assertNotEqual(first.get_world_group(), second.get_world_group())
+        second.barrier()
+        self.fake_dist.barrier.assert_called_with(group=second.get_world_group(), async_op=False)
+        second.destroy()
+
+    def test_failed_bootstrap_does_not_destroy_an_existing_default_group(self):
+        self.fake_dist.init_process_group.side_effect = RuntimeError("already initialized")
+        with self.assertRaisesRegex(RuntimeError, "already initialized"):
+            self.distributed._TorchNCCLDistUtils(initialize_default=True)
+        self.fake_dist.destroy_process_group.assert_not_called()
+
+    def test_bootstrap_cleanup_is_idempotent(self):
+        self.distributed.nccl_torch_dist_utils.destroy()
+        self.distributed.nccl_torch_dist_utils.destroy()
+        self.fake_dist.destroy_process_group.assert_called_once_with()
 
 
 if __name__ == "__main__":

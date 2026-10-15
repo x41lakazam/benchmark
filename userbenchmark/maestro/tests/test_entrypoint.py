@@ -20,6 +20,7 @@ def entrypoint():
     engine.run_benchmark = lambda config: None
     distributed = types.ModuleType(f"{package}.core.utils.distributed")
     distributed.get_rank_and_world_size = lambda: (0, 2)
+    distributed.nccl_torch_dist_utils = types.SimpleNamespace(destroy=lambda: None)
     path = Path(__file__).resolve().parents[1] / "run.py"
     spec = importlib.util.spec_from_file_location("userbenchmark.maestro.run", path)
     module = importlib.util.module_from_spec(spec)

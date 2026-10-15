@@ -24,6 +24,7 @@ class TorchGEMM(GEMMBlock):
     """
 
     registry_name = "torch_gemm"
+    supported_devices = {"cuda"}
 
     def __init__(self, axis: "TorchAxis", mat_a: torch.Tensor, mat_b: torch.Tensor, name: str = ""):
 
