@@ -13,10 +13,10 @@ from .block import BlockRegistry, CommBlock, GEMMBlock
 from .utils.logging import get_logger
 logger = get_logger(__name__)
 
-def _shared_timestamp() -> str:
+def _shared_timestamp(dist_utils=None) -> str:
     """Choose one output timestamp after distributed initialization."""
     timestamp = datetime.now().strftime("%d-%m-%y_%Hh%M")
-    return nccl_torch_dist_utils.all_gather_object(timestamp)[0]
+    return (dist_utils or nccl_torch_dist_utils).all_gather_object(timestamp)[0]
 
 
 def parse_axis_config(axis_config: dict) -> list[list[int]]:
@@ -105,7 +105,7 @@ def parse_op_preset(op: dict, axes: dict[str, list[list[int]]]) -> tuple[dict[st
     return new_axes, ops
 
 
-def parse_pattern(pattern: dict, axes: dict[str, list[list[int]]]) -> dict:
+def parse_pattern(pattern: dict, axes: dict[str, list[list[int]]], dtype_size: int = 2) -> dict:
     """
     Params:
         config - Configuration dictionary or path to configuration file, in this case it will be loaded from the file
@@ -113,10 +113,9 @@ def parse_pattern(pattern: dict, axes: dict[str, list[list[int]]]) -> dict:
 
     Parse configuration and unwraps presets, output a clean pattern where:
     - Every axis is a list of lists of ranks
-    - Communication sizes are converted from bytes to fp16 element counts
+    - Communication sizes are converted from bytes using the configured dtype
     - Matrix dimensions are element counts
     """
-    dtype_size = 2  # Current blocks use float16
 
     # - Pattern preset
     if "preset" in pattern:
@@ -151,9 +150,9 @@ def parse_pattern(pattern: dict, axes: dict[str, list[list[int]]]) -> dict:
         if issubclass(block_cls, CommBlock):
             byte_size = parse_size(op["vector_size"])
             if byte_size <= 0 or byte_size % dtype_size:
-                raise ValueError("vector_size must be positive and divisible by the fp16 element size (2 bytes)")
+                raise ValueError(f"vector_size must be positive and divisible by the element size ({dtype_size} bytes)")
             op["vector_size"] = byte_size // dtype_size
-            if op["block"] in {"torch_alltoall", "torch_all_gather", "torch_reduce_scatter"}:
+            if block_cls.requires_even_split:
                 # Validate every team so all ranks reject an invalid configuration.
                 for team in axes[axis_name]:
                     if op["vector_size"] % len(team):
@@ -179,17 +178,15 @@ def parse_backends(backends: dict, timestamp: str) -> dict:
         "backend_name": backend_config,
     }
     """
+    from .backends import get_backend
+
+    axis = {"name": "torch", "backend": "nccl", **backends.get("axis", {})}
+    spec = get_backend(axis)
     default_backends = {
-        "axis": {
-            "name": "torch",
-            "backend": "nccl",
-        },
-        "profiler": {
-            "name": "cupti",
-            "output_dir": None
-        }
+        "axis": axis,
+        "profiler": {"name": spec.default_profiler, "output_dir": None,
+                     **backends.get("profiler", {})},
     }
-    default_backends.update(backends)
     # Replace %D with the current date in the output_dir
     for backend in default_backends.values():
         if backend.get("output_dir", None) is not None:
@@ -200,7 +197,7 @@ def parse_backends(backends: dict, timestamp: str) -> dict:
 
     return default_backends
 
-def parse_config(config: Union[Path, dict, str], save_results_to_override: str = None) -> dict:
+def parse_config(config: Union[Path, dict, str], save_results_to_override: str = None, dist_utils=None) -> dict:
     """
     config: Can be a config dictionary, a path to a config file as path or str
     save_results_to_override: If provided, takes precedence over the config file's save_results_to value
@@ -220,7 +217,11 @@ def parse_config(config: Union[Path, dict, str], save_results_to_override: str =
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a mapping")
     config = deepcopy(config)
-    timestamp = _shared_timestamp()
+    timestamp = _shared_timestamp(dist_utils)
+    dtype = config.get("dtype", "float16")
+    dtype_sizes = {"float16": 2, "float32": 4, "bfloat16": 2}
+    if dtype not in dtype_sizes:
+        raise ValueError(f"Unsupported dtype {dtype!r}; choose {list(dtype_sizes)}")
     if save_results_to_override:
         config["save_results_to"] = save_results_to_override
 
@@ -249,7 +250,7 @@ def parse_config(config: Union[Path, dict, str], save_results_to_override: str =
     parsed_patterns = []
     for i, pattern in enumerate(config.get("patterns", [])):
         pattern["name"] = pattern.get("name", f"pattern_{i}")
-        parsed_patterns.append(parse_pattern(pattern, axes=axes))
+        parsed_patterns.append(parse_pattern(pattern, axes=axes, dtype_size=dtype_sizes[dtype]))
 
     parsed_backends = parse_backends(config.get("backends", {}), timestamp)
 
@@ -264,6 +265,7 @@ def parse_config(config: Union[Path, dict, str], save_results_to_override: str =
         save_results_to.parent.mkdir(parents=True, exist_ok=True)
 
     out_config = {
+        "dtype": dtype,
         "axes": axes,
         "axis_envs": axis_envs,
         "axis_params": axis_params,

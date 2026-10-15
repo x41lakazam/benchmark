@@ -196,3 +196,40 @@ Avg overlap: 85.3%
 ## Operation presets
 
 Based on hyper parameters, operation presets automatically create the right operations for a pre-configured task, for example a MoE fast forward pass. The operation configuration should have the `preset` key, matching one of the available op presets, a `name` that will be a prefix for every operation created and then a `params` dictionary matching the required parameters of the preset. Run `python -m userbenchmark.maestro.maestro list-op-presets` to list available presets. The ops presets are located in the `ops_presets` directory, each class has a `params_schema` that describe what parameters are expected.
+
+
+## Gloo and backend selection
+
+Use `backends.axis: {name: torch, backend: gloo}` for CPU/Gloo collectives;
+`torch/nccl` remains the default. See [gloo.yaml](../examples/config_files/gloo.yaml)
+for a four-rank example using all six communication blocks, parallel axes, and
+serial blocks on the same axis. Launch through the normal entry points:
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m userbenchmark.maestro.maestro run \
+  --config userbenchmark/maestro/examples/config_files/gloo.yaml \
+  --save-results-to /tmp/maestro-gloo.json
+# TorchBench also accepts the same configuration:
+torchrun --standalone --nproc-per-node=4 run_benchmark.py maestro \
+  userbenchmark/maestro/examples/config_files/gloo.yaml
+```
+
+Maestro still eagerly initializes NCCL on import, so one visible GPU per rank is
+required even for the CPU/Gloo workload. Backend runtimes own separate process
+groups and do not reinitialize the default group. Gloo's socket interface may be
+selected using `GLOO_SOCKET_IFNAME`; loopback is appropriate only for one host.
+
+The optional top-level `dtype` is `float16` by default; both backends support
+`float16` and `float32`, and NCCL additionally supports `bfloat16`. Communication
+`vector_size` remains a byte count; GEMM shapes remain element counts. Gloo uses
+CPU buffers and rejects CUDA-only GEMM, registered buffers, traffic-class options,
+and per-axis environment overrides before constructing the runtime.
+
+The default profiler follows the backend: CUPTI for NCCL, host timing for Gloo.
+An explicit incompatible profiler is rejected. Results include `backend`, `dtype`,
+and `timing_domain` (`cuda_activity` or `host_blocking_call`). Host latency includes
+Python dispatch, scheduling, and waiting for Gloo completion. Mean host overlap
+measures simultaneous call intervals, not physical network-transfer overlap.
+The documented shared-bandwidth formula is unchanged; with host timings it is
+normalized workload throughput and is not directly comparable to CUPTI/NCCL
+bandwidth. Host trace records use logical axis names in `stream_id`.

@@ -27,6 +27,7 @@ class _TorchCommBlock(CommBlock):
 
 
 class TorchAllToAll(_TorchCommBlock):
+    requires_even_split = True
     collective_fnc = dist.all_to_all_single
     registry_name = "torch_alltoall"
 
@@ -36,6 +37,7 @@ class TorchAllToAll(_TorchCommBlock):
 
 
 class TorchReduceScatter(_TorchCommBlock):
+    requires_even_split = True
     collective_fnc = dist.reduce_scatter_tensor
     registry_name = "torch_reduce_scatter"
 
@@ -51,6 +53,7 @@ class TorchReduceScatter(_TorchCommBlock):
 
 
 class TorchAllGather(_TorchCommBlock):
+    requires_even_split = True
     collective_fnc = dist.all_gather_into_tensor
     registry_name = "torch_all_gather"
 
@@ -95,10 +98,9 @@ class TorchSendRecvRing(_TorchCommBlock):
         send_op = dist.P2POp(dist.isend, src, send_rank, group=group)
         recv_op = dist.P2POp(dist.irecv, dst, recv_rank, group=group)
         works = dist.batch_isend_irecv([send_op, recv_op])
-        # Keep the axis stream ordered after the P2P operations without
-        # waiting for completion on the CPU.
+        # CUDA axes order their stream; host axes wait on the calling worker.
         for work in works:
-            work.block_current_stream()
+            current_axis.get().complete_work(work)
 
 
 class TorchAllReduce(_TorchCommBlock):

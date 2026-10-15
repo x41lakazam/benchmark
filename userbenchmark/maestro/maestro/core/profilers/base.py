@@ -17,6 +17,8 @@ class profiler_ctx(ABC):
         2. Callable with flags: `with profiler(nosave=True):`
     """
 
+    execution_mode = "cuda"
+    timing_domain = "cuda_activity"
     _saved_cnt = 0
     def __init__(self, output_dir: Optional[Union[Path, str]] = None):
         self.rank, self.world_size = get_rank_and_world_size()
@@ -25,6 +27,17 @@ class profiler_ctx(ABC):
         if self.output_dir is not None:
             self.output_dir = Path(self.output_dir)
             logger.info(f"Profiler output directory: {self.output_dir}")
+
+    def run_block(self, block):
+        block.run()
+
+    def __enter__(self):
+        self._enter()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._exit()
+        self.save_trace()
 
     def __call__(self, nosave: bool = False, name: str = None):
         """Return a context manager with custom flags

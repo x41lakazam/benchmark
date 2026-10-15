@@ -5,7 +5,6 @@ from .utils.logging import get_logger, get_root_rank_logger
 from .axis import Axis
 from .utils.format import format_size
 
-from .axis import TorchAxis
 
 logger = get_logger(__name__)
 rlogger = get_root_rank_logger()
@@ -55,7 +54,15 @@ class _Block(ABC, metaclass=_BlockRegistrer):
     _instances_cnt = 0
     registry_name: str = ""
 
+    supported_devices = None  # None: the block defines no placement restriction.
+    requires_even_split = False
     api_params_schema: dict[str, dict] = {}
+
+    @classmethod
+    def validate_backend(cls, backend):
+        if cls.supported_devices is not None and backend.device not in cls.supported_devices:
+            raise ValueError(f"Block {cls.registry_name} does not support device {backend.device}")
+
     """
     api_params_schema: Dict param_name: constraints where constraints is a dict that can implement:
         - 'default': A default value, any param without default is considered required
@@ -197,7 +204,7 @@ class CommBlock(_Block):
         dst_buf_size = cls.get_dst_buf_size(api_params["vector_size"], axis.team_size())
 
         if cached_tensor is None:
-            cached_tensor = torch.zeros(cls.get_tensor_size(api_params, axis), device="cuda", dtype=torch.float16)
+            cached_tensor = axis.allocate(cls.get_tensor_size(api_params, axis), fill=0)
 
         required_size = src_buf_size + dst_buf_size
         if cached_tensor.numel() < required_size:
@@ -247,7 +254,7 @@ class GEMMBlock(ComputeBlock):
     @classmethod
     def from_api_params(cls, axis: "Axis", name: str, api_params: dict, cached_tensor: Optional[torch.Tensor] = None):
         if cached_tensor is None:
-            cached_tensor = torch.ones(cls.get_tensor_size(api_params), device="cuda", dtype=torch.float16)
+            cached_tensor = axis.allocate(cls.get_tensor_size(api_params), fill=1)
 
         size_a = api_params["mat_a_shape"][0] * api_params["mat_a_shape"][1]
         size_b = api_params["mat_b_shape"][0] * api_params["mat_b_shape"][1]
@@ -266,8 +273,8 @@ class CopyBlock(_Block):
 class TorchNNModuleBlock(_Block):
     """Wrapper for torch.nn.Module"""
     def __init__(self, axis: "Axis", input_tensor: torch.Tensor, name: str = ""):
-        if not isinstance(axis, TorchAxis):
-            raise ValueError(f"{self.__class__.__name__} axis should be a TorchAxis")
+        if not isinstance(input_tensor, torch.Tensor):
+            raise ValueError(f"{self.__class__.__name__} requires a Torch tensor")
 
         super().__init__(axis, name)
         self.input_tensor = input_tensor

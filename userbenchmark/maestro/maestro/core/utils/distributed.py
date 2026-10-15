@@ -81,9 +81,8 @@ class _DistUtils(ABC):
         self._is_init = True
         return self.get_rank(), self.get_world_size()
 
-    @classmethod
     @abstractmethod
-    def get_world_group(cls):
+    def get_world_group(self):
         pass
 
     @abstractmethod
@@ -132,15 +131,26 @@ class _DistUtils(ABC):
         """Barrier all the ranks"""
         pass
 
+    @abstractmethod
+    def destroy(self):
+        """Release only this instance's resources; repeated calls are harmless."""
+        pass
+
 
 class _TorchDistUtils(_DistUtils):
-    def __init__(self, backend=None):
+    def __init__(self, backend, *, initialize_default=False):
         self.backend = backend
-        super().__init__()
+        self._initialize_default = initialize_default
+        self._owns_default = False
+        self._groups = []
+        try:
+            super().__init__()
+        except BaseException:
+            self.destroy()
+            raise
 
-    @classmethod
-    def get_world_group(cls):
-        return torch_dist.group.WORLD
+    def get_world_group(self):
+        return self._world_group
 
     def get_device(self) -> torch.device:
         visible_devices = torch.cuda.device_count()
@@ -155,6 +165,16 @@ class _TorchDistUtils(_DistUtils):
 
     def _init_dist(self):
         """Init torch distributed module"""
+
+        if not self._initialize_default:
+            if not torch_dist.is_initialized():
+                raise RuntimeError("Initialize the default process group before creating a backend runtime")
+            options = {"backend": self.backend}
+            if self.backend == "nccl":
+                options["device_id"] = self.get_device()
+            self._world_group = torch_dist.new_group(**options)
+            self._groups.append(self._world_group)
+            return
 
         rank, world_size = get_rank_and_world_size()
 
@@ -173,17 +193,21 @@ class _TorchDistUtils(_DistUtils):
             device_id=device,       # Passing device ID triggers nccl comm initialization
         )
 
+        self._owns_default = True
+        self._world_group = torch_dist.group.WORLD
         if rank == 0:
             logger.debug(f"Initialized torch distributed with {world_size} ranks")
 
 
     def barrier(self, async_op: bool = False) -> Optional[AsyncWorkHandle]:
-        work = torch_dist.barrier(async_op=async_op)
+        work = torch_dist.barrier(group=self._world_group, async_op=async_op)
         if async_op:
             return AsyncWorkHandle(work, type=AsyncWorkHandleType.TORCH)
         return None
 
     def get_pg_opts(self, params: dict = None) -> dict:
+        if params:
+            raise ValueError(f"Process-group options are unsupported by {self.backend}: {params}")
         return None
 
     def create_axis(self, axis: list[list[int]], params: dict = None) -> "torch_dist.ProcessGroup":
@@ -197,6 +221,7 @@ class _TorchDistUtils(_DistUtils):
                 options["device_id"] = self.get_device()
             pg = torch_dist.new_group(**options)
             if pg != torch_dist.GroupMember.NON_GROUP_MEMBER:
+                self._groups.append(pg)
                 my_group = pg
 
         return my_group
@@ -209,19 +234,22 @@ class _TorchDistUtils(_DistUtils):
 
     def all_gather_object(self, obj: Any) -> list[Any]:
         output = [None]*self.get_world_size()
-        torch_dist.all_gather_object(output, obj)
+        torch_dist.all_gather_object(output, obj, group=self._world_group)
         return output
 
     def destroy(self):
-        try:
+        """Release owned subgroups; only the bootstrap owner destroys WORLD."""
+        for group in reversed(self._groups):
+            torch_dist.destroy_process_group(group)
+        self._groups.clear()
+        if self._owns_default and torch_dist.is_initialized():
             torch_dist.destroy_process_group()
-        except:
-            # Probably already destroyed
-            pass
+        self._owns_default = False
+
 
 class _TorchNCCLDistUtils(_TorchDistUtils):
-    def __init__(self):
-        super().__init__(backend="nccl")
+    def __init__(self, *, initialize_default=False):
+        super().__init__(backend="nccl", initialize_default=initialize_default)
 
     def get_pg_opts(self, params: Optional[dict] = None) -> dict:
         if not params:
@@ -234,7 +262,7 @@ class _TorchNCCLDistUtils(_TorchDistUtils):
 
 
 try:
-    nccl_torch_dist_utils = _TorchNCCLDistUtils()
+    nccl_torch_dist_utils = _TorchNCCLDistUtils(initialize_default=True)
 except Exception as e:
     logger.error(f"Error initializing NCCL distributed utilities: {e}")
     raise

@@ -54,6 +54,13 @@ class _FakeDistUtils:
 class _FakeAxis(Axis):
     dist_utils = _FakeDistUtils()
 
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("dist_utils", self.dist_utils)
+        super().__init__(*args, **kwargs)
+
+    def complete_work(self, work):
+        work.wait()
+
     @contextmanager
     def _axis_ctx(self):
         yield
@@ -118,6 +125,17 @@ class AxisEnvironmentTest(unittest.TestCase):
             with self.subTest(traffic_class=traffic_class):
                 _FakeAxis([[0]], params={"traffic_class": traffic_class})
                 self.assertEqual(_FakeAxis.dist_utils.params_at_create, {"traffic_class": traffic_class})
+
+    def test_utilities_are_injected_per_instance(self):
+        first, second = _FakeDistUtils(), _FakeDistUtils()
+        first.get_rank = lambda: 0
+        second.get_rank = lambda: 1
+        a = _FakeAxis([[0], [1]], dist_utils=first)
+        b = _FakeAxis([[0], [1]], dist_utils=second)
+        self.assertEqual(a.root_rank, 0)
+        self.assertEqual(b.root_rank, 1)
+        self.assertIs(a.dist_utils, first)
+        self.assertIs(b.dist_utils, second)
 
     def test_rank_local_team_size(self):
         self.assertEqual(_FakeAxis([[1, 2], [0]]).team_size(), 1)

@@ -21,6 +21,7 @@ def load_definitions(path, names, namespace):
 
 
 class Comm:
+    requires_even_split = True
     @classmethod
     def _enrich_api_params_schema(cls, op):
         op.setdefault("vector_size", 24)
@@ -59,6 +60,14 @@ class ConfigValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "team_size=3"):
             self.parse(block="torch_all_gather", vector_size=16)
 
+    def test_dtype_size_and_alias_validation(self):
+        result = self.parse_pattern({"ops": [{"axis": "test", "block": "custom_gather", "vector_size": 24}]},
+                                    self.axes, dtype_size=4)
+        self.assertEqual(result["ops"][0]["vector_size"], 6)
+        with self.assertRaisesRegex(ValueError, "team_size=3"):
+            self.parse_pattern({"ops": [{"axis": "test", "block": "custom_gather", "vector_size": 16}]},
+                               self.axes, dtype_size=4)
+
     def test_invalid_inputs(self):
         for op in (
             {"block": "torch_all_gather", "vector_size": 3},
@@ -76,9 +85,9 @@ class AxisParametersTest(unittest.TestCase):
     def setUp(self):
         namespace = {
             "Path": Path, "deepcopy": deepcopy, "Union": __import__('typing').Union,
-            "_shared_timestamp": lambda: "test",
+            "_shared_timestamp": lambda dist_utils: "test",
             "parse_axis_config": lambda config: [[0]],
-            "parse_pattern": lambda pattern, axes: pattern,
+            "parse_pattern": lambda pattern, axes, dtype_size: pattern,
             "parse_backends": lambda backends, timestamp: backends,
         }
         self.parse_config = load_definitions("core/config_parser.py", {"parse_config"}, namespace)["parse_config"]
