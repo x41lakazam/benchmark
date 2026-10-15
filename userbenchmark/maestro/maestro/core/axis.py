@@ -3,6 +3,9 @@ from typing import Iterator, ContextManager
 from contextlib import contextmanager
 import contextvars
 import os
+import torch
+
+from .utils.distributed import nccl_torch_dist_utils
 from .utils.logging import get_logger
 
 
@@ -128,3 +131,41 @@ class Axis(ABC):
     def destroy(cls):
         """Destroy the axis"""
         pass
+
+
+class TorchAxis(Axis):
+    dist_utils = nccl_torch_dist_utils
+
+    def __init__(self, groups: list[list[int]], name: str = "", envs: dict[str, str] | None = None, params: dict | None = None):
+
+        super().__init__(groups, name=name, envs=envs, params=params)
+        self.stream = torch.cuda.Stream()
+
+    def get_process_group(self) -> torch.distributed.ProcessGroup:
+        return self.my_group
+
+    @staticmethod
+    def record_event(event: torch.cuda.Event):
+        event.record()
+
+    @staticmethod
+    def create_event() -> torch.cuda.Event:
+        return torch.cuda.Event()
+
+    def _axis_ctx(self):
+        return torch.cuda.stream(self.stream)
+
+    def wait_event(self, event: torch.cuda.Event):
+        self.stream.wait_event(event)
+
+    def synchronize(self):
+        self.stream.synchronize()
+
+    @classmethod
+    def synchronize_all(cls):
+        torch.cuda.synchronize()
+
+    @classmethod
+    def destroy(cls):
+        """Destroy the axis"""
+        cls.dist_utils.destroy()

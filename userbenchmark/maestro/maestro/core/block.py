@@ -5,6 +5,8 @@ from .utils.logging import get_logger, get_root_rank_logger
 from .axis import Axis
 from .utils.format import format_size
 
+from .axis import TorchAxis
+
 logger = get_logger(__name__)
 rlogger = get_root_rank_logger()
 
@@ -259,3 +261,29 @@ class GEMMBlock(ComputeBlock):
 class CopyBlock(_Block):
     """Copy block"""
     pass
+
+
+class TorchNNModuleBlock(_Block):
+    """Wrapper for torch.nn.Module"""
+    def __init__(self, axis: "Axis", input_tensor: torch.Tensor, name: str = ""):
+        if not isinstance(axis, TorchAxis):
+            raise ValueError(f"{self.__class__.__name__} axis should be a TorchAxis")
+
+        super().__init__(axis, name)
+        self.input_tensor = input_tensor
+        self.module: torch.nn.Module = None
+
+    @abstractmethod
+    def _run(self):
+        """Run the module's function"""
+        pass
+
+    def run(self):
+        if self.module is None:
+            raise ValueError(f"self.module has not been initialized for {self.__class__.__name__}")
+
+        return self._run()
+
+
+# Load all the custom blocks
+from .. import blocks
